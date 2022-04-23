@@ -484,7 +484,7 @@ pub(crate) async fn send_msg_to_smtp(
     }
 }
 
-/// Tries to send all messages currently in `smtp` table.
+/// Tries to send all messages currently in `smtp` and `smtp_mdns` tables.
 ///
 /// Logs and ignores SMTP errors to ensure that a single SMTP message constantly failing to be sent
 /// does not block other messages in the queue from being sent.
@@ -532,6 +532,13 @@ pub(crate) async fn send_smtp_messages(context: &Context, connection: &mut Smtp)
     Ok(success)
 }
 
+/// Tries to send MDN for message `msg_id` to `contact_id`.
+///
+/// Attempts to aggregate additional MDNs for `contact_id` into sent MDN.
+///
+/// On failure returns an error without removing any `smtp_mdns` entries, the caller is responsible
+/// for removing the corresponding entry to prevent endless loop in case the entry is invalid, e.g.
+/// points to non-existent message or contact.
 async fn send_mdn_msg_id(
     context: &Context,
     msg_id: MsgId,
