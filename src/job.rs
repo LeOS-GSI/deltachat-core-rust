@@ -4,22 +4,19 @@
 //! and job types.
 use std::fmt;
 
-use anyhow::{format_err, Context as _, Result};
+use anyhow::{Context as _, Result};
 use deltachat_derive::{FromSql, ToSql};
 use rand::{thread_rng, Rng};
 
 use crate::config::Config;
-use crate::contact::{normalize_name, Contact, ContactId, Modifier, Origin};
+use crate::contact::{normalize_name, Contact, Modifier, Origin};
 use crate::context::Context;
 use crate::dc_tools::time;
 use crate::events::EventType;
 use crate::imap::Imap;
-use crate::message::{Message, MsgId};
-use crate::mimefactory::MimeFactory;
-use crate::param::{Param, Params};
+use crate::param::Params;
 use crate::scheduler::InterruptInfo;
-use crate::smtp::{smtp_send, SendResult, Smtp};
-use crate::sql;
+use crate::smtp::Smtp;
 
 // results in ~3 weeks for the last backoff timespan
 const JOB_RETRIES: u32 = 17;
@@ -87,9 +84,6 @@ pub enum Action {
     // UID synchronization is high-priority to make sure correct UIDs
     // are used by message moving/deletion.
     ResyncFolders = 300,
-
-    // Jobs in the SMTP-thread, range from DC_SMTP_THREAD..DC_SMTP_THREAD+999
-    SendMdn = 5010,
 }
 
 impl From<Action> for Thread {
@@ -101,8 +95,6 @@ impl From<Action> for Thread {
             ResyncFolders => Thread::Imap,
             UpdateRecentQuota => Thread::Imap,
             DownloadMsg => Thread::Imap,
-
-            SendMdn => Thread::Smtp,
         }
     }
 }
@@ -193,118 +185,6 @@ impl Job {
         Ok(())
     }
 
-    /// Get `SendMdn` jobs with foreign_id equal to `contact_id` excluding the `job_id` job.
-    async fn get_additional_mdn_jobs(
-        &self,
-        context: &Context,
-        contact_id: ContactId,
-    ) -> Result<(Vec<u32>, Vec<String>)> {
-        // Extract message IDs from job parameters
-        let res: Vec<(u32, MsgId)> = context
-            .sql
-            .query_map(
-                "SELECT id, param FROM jobs WHERE foreign_id=? AND id!=?",
-                paramsv![contact_id, self.job_id],
-                |row| {
-                    let job_id: u32 = row.get(0)?;
-                    let params_str: String = row.get(1)?;
-                    let params: Params = params_str.parse().unwrap_or_default();
-                    Ok((job_id, params))
-                },
-                |jobs| {
-                    let res = jobs
-                        .filter_map(|row| {
-                            let (job_id, params) = row.ok()?;
-                            let msg_id = params.get_msg_id()?;
-                            Some((job_id, msg_id))
-                        })
-                        .collect();
-                    Ok(res)
-                },
-            )
-            .await?;
-
-        // Load corresponding RFC724 message IDs
-        let mut job_ids = Vec::new();
-        let mut rfc724_mids = Vec::new();
-        for (job_id, msg_id) in res {
-            if let Ok(Message { rfc724_mid, .. }) = Message::load_from_db(context, msg_id).await {
-                job_ids.push(job_id);
-                rfc724_mids.push(rfc724_mid);
-            }
-        }
-        Ok((job_ids, rfc724_mids))
-    }
-
-    async fn send_mdn(&mut self, context: &Context, smtp: &mut Smtp) -> Status {
-        let mdns_enabled = job_try!(context.get_config_bool(Config::MdnsEnabled).await);
-        if !mdns_enabled {
-            // User has disabled MDNs after job scheduling but before
-            // execution.
-            return Status::Finished(Err(format_err!("MDNs are disabled")));
-        }
-
-        let contact_id = ContactId::new(self.foreign_id);
-        let contact = job_try!(Contact::load_from_db(context, contact_id).await);
-        if contact.is_blocked() {
-            return Status::Finished(Err(format_err!("Contact is blocked")));
-        }
-
-        let msg_id = if let Some(msg_id) = self.param.get_msg_id() {
-            msg_id
-        } else {
-            return Status::Finished(Err(format_err!(
-                "SendMdn job has invalid parameters: {}",
-                self.param
-            )));
-        };
-
-        // Try to aggregate other SendMdn jobs and send a combined MDN.
-        let (additional_job_ids, additional_rfc724_mids) = self
-            .get_additional_mdn_jobs(context, contact_id)
-            .await
-            .unwrap_or_default();
-
-        if !additional_rfc724_mids.is_empty() {
-            info!(
-                context,
-                "SendMdn job: aggregating {} additional MDNs",
-                additional_rfc724_mids.len()
-            )
-        }
-
-        let msg = job_try!(Message::load_from_db(context, msg_id).await);
-        let mimefactory =
-            job_try!(MimeFactory::from_mdn(context, &msg, additional_rfc724_mids).await);
-        let rendered_msg = job_try!(mimefactory.render(context).await);
-        let body = rendered_msg.message;
-
-        let addr = contact.get_addr();
-        let recipient = job_try!(async_smtp::EmailAddress::new(addr.to_string())
-            .map_err(|err| format_err!("invalid recipient: {} {:?}", addr, err)));
-        let recipients = vec![recipient];
-
-        // connect to SMTP server, if not yet done
-        if let Err(err) = smtp.connect_configured(context).await {
-            warn!(context, "SMTP connection failure: {:?}", err);
-            smtp.last_send_error = Some(err.to_string());
-            return Status::RetryLater;
-        }
-
-        match smtp_send(context, &recipients, &body, smtp, msg_id, 0).await {
-            SendResult::Success => {
-                // Remove additional SendMdn jobs we have aggregated into this one.
-                job_try!(kill_ids(context, &additional_job_ids).await);
-                Status::Finished(Ok(()))
-            }
-            SendResult::Retry => {
-                info!(context, "Temporary SMTP failure while sending an MDN");
-                Status::RetryLater
-            }
-            SendResult::Failure(err) => Status::Finished(Err(err)),
-        }
-    }
-
     /// Read the recipients from old emails sent by the user and add them as contacts.
     /// This way, we can already offer them some email addresses they can write to.
     ///
@@ -387,22 +267,6 @@ pub async fn kill_action(context: &Context, action: Action) -> Result<()> {
     Ok(())
 }
 
-/// Remove jobs with specified IDs.
-async fn kill_ids(context: &Context, job_ids: &[u32]) -> Result<()> {
-    if job_ids.is_empty() {
-        return Ok(());
-    }
-    let q = format!(
-        "DELETE FROM jobs WHERE id IN({})",
-        sql::repeat_vars(job_ids.len())?
-    );
-    context
-        .sql
-        .execute(q, rusqlite::params_from_iter(job_ids))
-        .await?;
-    Ok(())
-}
-
 pub async fn action_exists(context: &Context, action: Action) -> Result<bool> {
     let exists = context
         .sql
@@ -478,13 +342,6 @@ impl<'a> Connection<'a> {
         match self {
             Connection::Inbox(imap) => imap,
             _ => panic!("Not an inbox"),
-        }
-    }
-
-    fn smtp(&mut self) -> &mut Smtp {
-        match self {
-            Connection::Smtp(smtp) => smtp,
-            _ => panic!("Not a smtp"),
         }
     }
 }
@@ -565,7 +422,6 @@ async fn perform_job_action(
     );
 
     let try_res = match job.action {
-        Action::SendMdn => job.send_mdn(context, connection.smtp()).await,
         Action::ResyncFolders => job.resync_folders(context, connection.inbox()).await,
         Action::FetchExistingMsgs => job.fetch_existing_msgs(context, connection.inbox()).await,
         Action::UpdateRecentQuota => match context.update_recent_quota(connection.inbox()).await {
@@ -600,19 +456,6 @@ fn get_backoff_time_offset(tries: u32, action: Action) -> i64 {
     }
 }
 
-pub(crate) async fn send_mdn(context: &Context, msg_id: MsgId, from_id: ContactId) -> Result<()> {
-    let mut param = Params::new();
-    param.set(Param::MsgId, msg_id.to_u32().to_string());
-
-    add(
-        context,
-        Job::new(Action::SendMdn, from_id.to_u32(), param, 0),
-    )
-    .await?;
-
-    Ok(())
-}
-
 pub(crate) async fn schedule_resync(context: &Context) -> Result<()> {
     kill_action(context, Action::ResyncFolders).await?;
     add(
@@ -637,10 +480,6 @@ pub async fn add(context: &Context, job: Job) -> Result<()> {
             | Action::DownloadMsg => {
                 info!(context, "interrupt: imap");
                 context.interrupt_inbox(InterruptInfo::new(false)).await;
-            }
-            Action::SendMdn => {
-                info!(context, "interrupt: smtp");
-                context.interrupt_smtp(InterruptInfo::new(false)).await;
             }
         }
     }

@@ -23,6 +23,7 @@
 - Speed up message receiving via IMAP a bit #3225
 - mark messages as seen on IMAP in batches #3223
 - remove Received: based draft detection heuristic #3230
+- send normal messages with higher priority than MDNs #3243
 
 
 ## 1.77.0
