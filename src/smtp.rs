@@ -584,12 +584,6 @@ async fn send_mdn_msg_id(
         .map_err(|err| format_err!("invalid recipient: {} {:?}", addr, err))?;
     let recipients = vec![recipient];
 
-    // connect to SMTP server, if not yet done
-    if let Err(err) = smtp.connect_configured(context).await {
-        smtp.last_send_error = Some(err.to_string());
-        bail!("SMTP connection failure: {:?}", err);
-    }
-
     match smtp_send(context, &recipients, &body, smtp, msg_id, 0).await {
         SendResult::Success => {
             info!(context, "Successfully sent MDN for {}", msg_id);
