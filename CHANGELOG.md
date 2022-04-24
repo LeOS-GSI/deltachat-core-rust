@@ -13,6 +13,7 @@
 - Make sure, videochat-room-names are always URL-safe #3231
 - Try removing account folder multiple times in case of failure #3229
 - Ignore messages from all spam folders if there are many #3246
+- Send locations in the background regardless of SMTP loop activity #3247
 
 ### Changes
 
