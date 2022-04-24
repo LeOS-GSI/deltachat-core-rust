@@ -16,7 +16,6 @@ use crate::events::EventType;
 use crate::imap::Imap;
 use crate::param::Params;
 use crate::scheduler::InterruptInfo;
-use crate::smtp::Smtp;
 
 // results in ~3 weeks for the last backoff timespan
 const JOB_RETRIES: u32 = 17;
@@ -28,7 +27,6 @@ const JOB_RETRIES: u32 = 17;
 #[repr(u32)]
 pub(crate) enum Thread {
     Imap = 100,
-    Smtp = 5000,
 }
 
 /// Job try result.
@@ -325,29 +323,18 @@ async fn add_all_recipients_as_contacts(context: &Context, imap: &mut Imap, fold
 
 pub(crate) enum Connection<'a> {
     Inbox(&'a mut Imap),
-    Smtp(&'a mut Smtp),
-}
-
-impl<'a> fmt::Display for Connection<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Connection::Inbox(_) => write!(f, "Inbox"),
-            Connection::Smtp(_) => write!(f, "Smtp"),
-        }
-    }
 }
 
 impl<'a> Connection<'a> {
     fn inbox(&mut self) -> &mut Imap {
         match self {
             Connection::Inbox(imap) => imap,
-            _ => panic!("Not an inbox"),
         }
     }
 }
 
 pub(crate) async fn perform_job(context: &Context, mut connection: Connection<'_>, mut job: Job) {
-    info!(context, "{}-job {} started...", &connection, &job);
+    info!(context, "job {} started...", &job);
 
     let try_res = match perform_job_action(context, &mut job, &mut connection, 0).await {
         Status::RetryNow => perform_job_action(context, &mut job, &mut connection, 1).await,
@@ -359,17 +346,13 @@ pub(crate) async fn perform_job(context: &Context, mut connection: Connection<'_
             let tries = job.tries + 1;
 
             if tries < JOB_RETRIES {
-                info!(
-                    context,
-                    "{} thread increases job {} tries to {}", &connection, job, tries
-                );
+                info!(context, "increase job {} tries to {}", job, tries);
                 job.tries = tries;
                 let time_offset = get_backoff_time_offset(tries, job.action);
                 job.desired_timestamp = time() + time_offset;
                 info!(
                     context,
-                    "{}-job #{} not succeeded on try #{}, retry in {} seconds.",
-                    &connection,
+                    "job #{} not succeeded on try #{}, retry in {} seconds.",
                     job.job_id as u32,
                     tries,
                     time_offset
@@ -380,10 +363,7 @@ pub(crate) async fn perform_job(context: &Context, mut connection: Connection<'_
             } else {
                 info!(
                     context,
-                    "{} thread removes job {} as it exhausted {} retries",
-                    &connection,
-                    job,
-                    JOB_RETRIES
+                    "remove job {} as it exhausted {} retries", job, JOB_RETRIES
                 );
                 job.delete(context).await.unwrap_or_else(|err| {
                     error!(context, "failed to delete job: {}", err);
@@ -394,13 +374,10 @@ pub(crate) async fn perform_job(context: &Context, mut connection: Connection<'_
             if let Err(err) = res {
                 warn!(
                     context,
-                    "{} removes job {} as it failed with error {:#}", &connection, job, err
+                    "remove job {} as it failed with error {:#}", job, err
                 );
             } else {
-                info!(
-                    context,
-                    "{} removes job {} as it succeeded", &connection, job
-                );
+                info!(context, "remove job {} as it succeeded", job);
             }
 
             job.delete(context).await.unwrap_or_else(|err| {
@@ -416,10 +393,7 @@ async fn perform_job_action(
     connection: &mut Connection<'_>,
     tries: u32,
 ) -> Status {
-    info!(
-        context,
-        "{} begin immediate try {} of job {}", &connection, tries, job
-    );
+    info!(context, "begin immediate try {} of job {}", tries, job);
 
     let try_res = match job.action {
         Action::ResyncFolders => job.resync_folders(context, connection.inbox()).await,
